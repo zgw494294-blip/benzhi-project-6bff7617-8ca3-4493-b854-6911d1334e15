@@ -95,6 +95,7 @@ func (s *Store) saveLocked() error {
 }
 
 // CreateProject 将项目创建与幂等记录放在同一临界区和快照写入中。
+// 当快照写入失败时回滚内存中的项目和幂等记录，保证内存状态与磁盘一致。
 func (s *Store) CreateProject(p *domain.CorpusProject, operation, key string) (*domain.CorpusProject, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -111,16 +112,23 @@ func (s *Store) CreateProject(p *domain.CorpusProject, operation, key string) (*
 	}
 	cp := cloneProject(p)
 	s.projects[p.ProjectID] = cp
+	var idemAdded bool
 	if key != "" {
 		s.idem[key] = IdempotencyRecord{Operation: operation, ProjectID: p.ProjectID, Project: cloneProject(cp)}
+		idemAdded = true
 	}
 	if err := s.saveLocked(); err != nil {
+		delete(s.projects, p.ProjectID)
+		if idemAdded {
+			delete(s.idem, key)
+		}
 		return nil, false, err
 	}
 	return cloneProject(cp), false, nil
 }
 
 // ApplyProjectCommand 对版本校验、领域变更、幂等记录和快照写入进行原子串行化。
+// 当快照写入失败时恢复变更前的项目和幂等记录，保证内存状态与磁盘一致。
 func (s *Store) ApplyProjectCommand(projectID string, expectedVersion int, operation, key string, mutate func(*domain.CorpusProject) error) (*domain.CorpusProject, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,11 +151,18 @@ func (s *Store) ApplyProjectCommand(projectID string, expectedVersion int, opera
 	if err := mutate(next); err != nil {
 		return nil, false, err
 	}
+	previous := s.projects[projectID]
 	s.projects[projectID] = next
+	var idemAdded bool
 	if key != "" {
 		s.idem[key] = IdempotencyRecord{Operation: operation, ProjectID: projectID, Project: cloneProject(next)}
+		idemAdded = true
 	}
 	if err := s.saveLocked(); err != nil {
+		s.projects[projectID] = previous
+		if idemAdded {
+			delete(s.idem, key)
+		}
 		return nil, false, err
 	}
 	return cloneProject(next), false, nil
@@ -188,13 +203,26 @@ func (s *Store) ReleaseProject(projectID string, expectedVersion int, operation,
 	if err != nil {
 		return nil, crypto.Credential{}, false, err
 	}
+	previous := s.projects[projectID]
 	s.projects[projectID] = next
-	s.credentials[credential.CredentialID] = credential
+	var credentialAdded, idemAdded bool
+	if _, exists := s.credentials[credential.CredentialID]; !exists {
+		s.credentials[credential.CredentialID] = credential
+		credentialAdded = true
+	}
 	if key != "" {
 		copyCredential := credential
 		s.idem[key] = IdempotencyRecord{Operation: operation, ProjectID: projectID, Project: cloneProject(next), Credential: &copyCredential}
+		idemAdded = true
 	}
 	if err = s.saveLocked(); err != nil {
+		s.projects[projectID] = previous
+		if credentialAdded {
+			delete(s.credentials, credential.CredentialID)
+		}
+		if idemAdded {
+			delete(s.idem, key)
+		}
 		return nil, crypto.Credential{}, false, err
 	}
 	return cloneProject(next), credential, false, nil
