@@ -47,6 +47,14 @@ func cloneProject(p *domain.CorpusProject) *domain.CorpusProject {
 	return &cp
 }
 
+// cloneCredential 复制凭据的 RevisionIDs 切片，避免调用方修改返回结果时污染 Store 的共享状态。
+func cloneCredential(c crypto.Credential) crypto.Credential {
+	if c.RevisionIDs != nil {
+		c.RevisionIDs = append([]string(nil), c.RevisionIDs...)
+	}
+	return c
+}
+
 func (s *Store) load() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,7 +169,7 @@ func (s *Store) ReleaseProject(projectID string, expectedVersion int, operation,
 			if rec.Operation != operation || rec.ProjectID != projectID || rec.Credential == nil {
 				return nil, crypto.Credential{}, false, domain.ErrConflict
 			}
-			return cloneProject(rec.Project), *rec.Credential, true, nil
+			return cloneProject(rec.Project), cloneCredential(*rec.Credential), true, nil
 		}
 	}
 	current, ok := s.projects[projectID]
@@ -178,7 +186,7 @@ func (s *Store) ReleaseProject(projectID string, expectedVersion int, operation,
 		if err := crypto.Verify(existing, current); err != nil {
 			return nil, crypto.Credential{}, false, domain.ErrConflict
 		}
-		return cloneProject(current), existing, true, nil
+		return cloneProject(current), cloneCredential(existing), true, nil
 	}
 	next := cloneProject(current)
 	if err := next.Freeze(); err != nil {
@@ -189,15 +197,15 @@ func (s *Store) ReleaseProject(projectID string, expectedVersion int, operation,
 		return nil, crypto.Credential{}, false, err
 	}
 	s.projects[projectID] = next
-	s.credentials[credential.CredentialID] = credential
+	s.credentials[credential.CredentialID] = cloneCredential(credential)
 	if key != "" {
-		copyCredential := credential
-		s.idem[key] = IdempotencyRecord{Operation: operation, ProjectID: projectID, Project: cloneProject(next), Credential: &copyCredential}
+		storedCredential := cloneCredential(credential)
+		s.idem[key] = IdempotencyRecord{Operation: operation, ProjectID: projectID, Project: cloneProject(next), Credential: &storedCredential}
 	}
 	if err = s.saveLocked(); err != nil {
 		return nil, crypto.Credential{}, false, err
 	}
-	return cloneProject(next), credential, false, nil
+	return cloneProject(next), cloneCredential(credential), false, nil
 }
 
 func (s *Store) PutProject(p *domain.CorpusProject) {
@@ -233,7 +241,7 @@ func (s *Store) ListProjects() []*domain.CorpusProject {
 func (s *Store) PutCredential(c crypto.Credential) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.credentials[c.CredentialID] = c
+	s.credentials[c.CredentialID] = cloneCredential(c)
 	_ = s.saveLocked()
 }
 func (s *Store) GetCredential(id string) (crypto.Credential, error) {
@@ -243,7 +251,7 @@ func (s *Store) GetCredential(id string) (crypto.Credential, error) {
 	if !ok {
 		return c, domain.ErrNotFound
 	}
-	return c, nil
+	return cloneCredential(c), nil
 }
 func (s *Store) CredentialsForProject(projectID string) []crypto.Credential {
 	s.mu.RLock()
@@ -251,7 +259,7 @@ func (s *Store) CredentialsForProject(projectID string) []crypto.Credential {
 	out := []crypto.Credential{}
 	for _, c := range s.credentials {
 		if c.ProjectID == projectID {
-			out = append(out, c)
+			out = append(out, cloneCredential(c))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].IssuedAt.After(out[j].IssuedAt) })
