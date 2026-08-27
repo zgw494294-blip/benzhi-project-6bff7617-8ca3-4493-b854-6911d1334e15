@@ -53,6 +53,10 @@ func (s *Store) load() {
 	s.loadLocked()
 }
 func (s *Store) loadLocked() {
+	// Rebuild projections from the snapshot on every replay.
+	s.projects = map[string]*domain.CorpusProject{}
+	s.credentials = map[string]crypto.Credential{}
+	s.idem = map[string]IdempotencyRecord{}
 	b, err := os.ReadFile(filepath.Join(s.dir, "snapshot.json"))
 	if err != nil {
 		return
